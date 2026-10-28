@@ -126,7 +126,7 @@
             const soundMap = {
                 "join": "playerJoin.ogg",
                 "leave": "sfx/leave.ogg",
-                "start": "gameStart.ogg",
+                "start": "sfx/start.ogg",
                 "chips": "sfx/chips.ogg",
                 "deal": ["sfx/deal1.ogg", "sfx/deal2.ogg"],
                 "knock": "sfx/knock.ogg",
