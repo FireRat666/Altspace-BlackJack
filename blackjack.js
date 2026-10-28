@@ -8,6 +8,76 @@
     const DISCONNECT_TIMEOUT_MS = 45000;
     const DOMAIN = "https://blackjack.firer.at/";
 
+    // --- Hearing distance ---
+    // Sounds fade with the local player's distance from the game: full volume within `near` metres,
+    // silent from `far` metres, so people elsewhere in the world aren't disturbed. The head position
+    // comes from an empty object attached to the player's head (Unity reports where it is), or from
+    // pose-update until that works. All the games on a page share one tracker.
+    function headTracker() {
+        if (window.BanterGamesHead) return window.BanterGamesHead;
+        const head = window.BanterGamesHead = { marker: null, attaching: false, markerPos: null, posePos: null };
+        const scene = BS.BanterScene.GetInstance();
+        scene.On('pose-update', e => {
+            const h = e && e.detail && e.detail.head;
+            if (h && h.position) head.posePos = h.position;
+        });
+        const attach = async () => {
+            const uid = scene.localUser && scene.localUser.uid;
+            if (!uid || head.marker || head.attaching) return;
+            head.attaching = true;
+            try {
+                const go = await new BS.GameObject("GameSoundsHead").Async();
+                head.marker = go;
+                if (typeof BS.AttachedObject === 'function') {
+                    const point = BS.AvatarBoneName ? BS.AvatarBoneName.HEAD : 0;
+                    const attached = await go.AddComponent(new BS.AttachedObject({ uid, avatarAttachmentPoint: point }));
+                    await attached.Attach(uid);
+                } else if (typeof scene.LegacyAttachObject === 'function' && BS.LegacyAttachmentPosition) {
+                    await scene.LegacyAttachObject(go, uid, BS.LegacyAttachmentPosition.HEAD);
+                } else {
+                    return; // no way to attach here: pose-update only
+                }
+                const PN = BS.PN || BS.PropertyName;
+                if (typeof go.WatchTransform === 'function' && PN) {
+                    await go.WatchTransform([PN.position], t => {
+                        if (head.marker === go && t && t.position) head.markerPos = t.position;
+                    });
+                }
+            } finally {
+                head.attaching = false;
+            }
+        };
+        const tryAttach = () => attach().catch(e => console.warn("Game sounds: could not follow the head", e));
+        // The SDK drops attachments when the player leaves, so the marker is made again when they
+        // come back (a moment later, so the SDK is ready).
+        scene.On('user-left', e => {
+            if (!(e && e.detail && e.detail.isLocal)) return;
+            try { if (head.marker) head.marker.Destroy(); } catch (err) { }
+            head.marker = null;
+            head.markerPos = null;
+        });
+        scene.On('user-joined', e => {
+            if (e && e.detail && e.detail.isLocal && !head.marker) setTimeout(tryAttach, 5000);
+        });
+        (async () => {
+            while (!scene.localUser || scene.localUser.uid === undefined) await new Promise(r => setTimeout(r, 500));
+            await tryAttach();
+        })();
+        return head;
+    }
+
+    // 0-1: how loud a sound from `centre` (a world position) is for the local player.
+    function distanceGain(centre, near, far) {
+        const head = headTracker();
+        const p = head.markerPos || head.posePos;
+        if (!p || !centre) return 1; // not known yet, so play it
+        const d = Math.hypot(p.x - centre.x, p.y - centre.y, p.z - centre.z);
+        if (d <= near) return 1;
+        if (!(far > near) || d >= far) return 0;
+        const f = 1 - (d - near) / (far - near);
+        return f * f;
+    }
+
     class BlackjackGame {
         constructor() {
             this.gameState = null;
@@ -31,10 +101,16 @@
 
             this.params = {
                 position: getParam("position", "0 0 2"),
+                volume: parseFloat(getParam("sound-volume", "0.4")), // 0-1; 0 = no sounds
+                soundNear: parseFloat(getParam("sound-near", "2.5")), // metres: full volume within this
+                soundFar: parseFloat(getParam("sound-far", "10")), // metres: silent from here
                 rotation: getParam("rotation", "0 0 0"),
                 instance: getParam("instance", "blackjack_game"),
                 debug: getParam("debug", "false") === "true"
             };
+            if (isNaN(this.params.volume)) this.params.volume = 0.4;
+            if (isNaN(this.params.soundNear)) this.params.soundNear = 2.5;
+            if (isNaN(this.params.soundFar)) this.params.soundFar = 10;
             this.stateKey = this.params.instance;
         }
 
@@ -42,11 +118,31 @@
             if (this.params.debug) console.log("[Blackjack]", ...args);
         }
 
+        // Sound files in Assets/sfx (made by sound-tools/make_sounds.py)
         playLocalSound(soundFile) {
             if (this.isMuted || !soundFile) return;
-            const audio = new Audio(`${DOMAIN}Assets/${soundFile}`);
+            // The original recordings are in Assets/, the newer sounds in Assets/sfx/ (made by
+            // sound-tools/make_sounds.py). A list means several takes, picked at random.
+            const soundMap = {
+                "join": "playerJoin.ogg",
+                "leave": "sfx/leave.ogg",
+                "start": "gameStart.ogg",
+                "chips": "sfx/chips.ogg",
+                "deal": ["sfx/deal1.ogg", "sfx/deal2.ogg"],
+                "knock": "sfx/knock.ogg",
+                "bust": "sfx/bust.ogg",
+                "lose": "sfx/lose.ogg",
+                "win": "sfx/win.ogg"
+            };
+            let file = soundMap[soundFile];
+            if (Array.isArray(file)) file = file[Math.floor(Math.random() * file.length)];
+            if (!file) return;
+            const audio = new Audio(`${DOMAIN}Assets/${encodeURI(file)}`);
             audio.crossOrigin = "anonymous";
-            audio.volume = 0.3;
+            // Quieter the further you are from the table (see distanceGain)
+            const volume = this.params.volume * distanceGain(this.parseVector3(this.params.position), this.params.soundNear, this.params.soundFar);
+            if (!(volume > 0.005)) return;
+            audio.volume = Math.min(1, volume);
             audio.play().catch(e => this.log("Audio play error:", e));
         }
 
@@ -86,6 +182,7 @@
 
             this.log("Initializing Blackjack Game...");
             await this.buildEnvironment();
+            headTracker(); // start following the head for sound distance
 
             scene.On("space-state-changed", this.onSpaceStateChanged.bind(this));
             scene.On("user-left", this.onSpaceUserLeft.bind(this));
@@ -637,14 +734,14 @@
                 if (Object.keys(state.players).length < MAX_PLAYERS && !player) {
                     const pos = [0, 1, 2, 3, 4, 5, 6].find(p => !Object.values(state.players).some(pl => pl.position === p));
                     state.players[senderUid] = { uid: senderUid, position: pos, hand: [], status: 'waiting', trophies: 0, connected: true, disconnectTime: 0, chips: 1000, bet: 10 };
-                    this.playSound(state, "playerJoin.ogg");
+                    this.playSound(state, "join");
                 }
             } else if (type === "adjust-bet" && player) {
                 if (!state.gameStarted) {
                     player.bet += data.amount;
                     if (player.bet < 10) player.bet = 10;
                     if (player.bet > player.chips) player.bet = player.chips;
-                    this.playSound(state, "card_flick.ogg");
+                    this.playSound(state, "chips");
                 }
             } else if (type === "start") {
                 if (Object.keys(state.players).length >= MIN_PLAYERS) {
@@ -670,12 +767,12 @@
                     state.gameStarted = true;
                     state.currentPlayerId = Object.keys(state.players)[0];
                     state.turnStartTime = Date.now();
-                    this.playSound(state, "gameStart.ogg");
+                    this.playSound(state, "start");
                 }
             } else if (type === "leave") {
                 delete state.players[senderUid];
                 if (data.playSound !== false) { // Only play sound if explicitly not false
-                    this.playSound(state, "playerKick.ogg");
+                    this.playSound(state, "leave");
                 }
                 if (state.currentPlayerId === senderUid) {
                     this.nextTurn(state);
@@ -684,8 +781,9 @@
                 if (state.currentPlayerId === senderUid) {
                     const activeHand = player.activeHandIndex === 2 ? player.splitHand : player.hand;
                     activeHand.push(state.deck.pop());
-                    this.playSound(state, "card_flick.ogg");
+                    this.playSound(state, "deal");
                     if (this.calculateHandValue(activeHand) > 21) {
+                        this.playSound(state, "bust");
                         if (player.activeHandIndex === 1 && player.splitHand) {
                             player.activeHandIndex = 2;
                             state.turnStartTime = Date.now();
@@ -699,7 +797,7 @@
                 }
             } else if (player && type === "stand") {
                 if (state.currentPlayerId === senderUid) {
-                    this.playSound(state, "card_flick.ogg");
+                    this.playSound(state, "knock");
                     if (player.activeHandIndex === 1 && player.splitHand) {
                         player.activeHandIndex = 2;
                         state.turnStartTime = Date.now();
@@ -714,7 +812,7 @@
                     if (activeHand.length === 2 && player.chips >= player.bet) {
                         player.chips -= player.bet;
                         activeHand.push(state.deck.pop());
-                        this.playSound(state, "card_flick.ogg");
+                        this.playSound(state, "deal");
                         
                         if (player.activeHandIndex === 2) {
                             player.splitDoubled = true;
@@ -740,7 +838,7 @@
                         player.splitHand.push(state.deck.pop());
                         player.activeHandIndex = 1;
                         state.turnStartTime = Date.now();
-                        this.playSound(state, "card_flick.ogg");
+                        this.playSound(state, "deal");
                     }
                 }
             } else if (!player && type === "stand" && state.currentPlayerId === senderUid) {
@@ -825,12 +923,13 @@
             }
             if (winners.length > 0) {
                 state.winnerSummary = "WINNERS: " + winners.join(", ");
-                this.playSound(state, "fanfare with pop.ogg");
+                this.playSound(state, "win");
             } else if (dealerVal <= 21) {
                 state.winnerSummary = `DEALER WINS (${dealerVal})`;
+                this.playSound(state, "lose");
             } else {
                 state.winnerSummary = "EVERYONE WINS! (Dealer Bust)";
-                this.playSound(state, "fanfare with pop.ogg");
+                this.playSound(state, "win");
             }
         }
 
