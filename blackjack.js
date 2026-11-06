@@ -78,6 +78,70 @@
         return f * f;
     }
 
+    // --- Switching off when far away ---
+    // Beyond `cull-distance` metres the whole game is deleted, so it costs nothing, and it is built
+    // again when the player comes back. (Switching it off with SetActive isn't enough: BanterUI panels
+    // lose their contents when switched off and on.) The game logic and the host duties keep running
+    // meanwhile; only the drawing stops. `resetUI` clears whatever pointed at the deleted objects.
+    function distanceSwitch(game, resetUI) {
+        const head = headTracker();
+        const c = game.parseVector3(game.params.position);
+        const centre = { x: c.x, y: c.y + 1, z: c.z }; // table height
+        let busy = false;
+        setInterval(async () => {
+            const far = game.params.cullDistance;
+            const p = head.markerPos || head.posePos;
+            if (busy || !(far > 0) || !p) return;
+            const d = Math.hypot(p.x - centre.x, p.y - centre.y, p.z - centre.z);
+            busy = true;
+            try {
+                if (!game.culled && d > far + 1) {
+                    game.culled = true;
+                    const root = game.root;
+                    game.root = null;
+                    resetUI();
+                    if (root) root.Destroy();
+                    game.log(`Switched off (${d.toFixed(1)} m away).`);
+                } else if (game.culled && d < far) {
+                    game.log(`Switching back on (${d.toFixed(1)} m away)...`);
+                    await game.buildEnvironment();
+                    if (game.ui.muteBtn) game.ui.muteBtn.text = game.isMuted ? "🔇" : "🔊";
+                    game.culled = false;
+                    game.updateUI();
+                }
+            } catch (err) {
+                console.warn("Distance switch failed", err);
+            } finally {
+                busy = false;
+            }
+        }, 1000);
+    }
+
+    // --- Host ---
+    // One person, the host, runs the timers, kicks and automatic steps. When the host leaves the
+    // space (or none is set), the next host is the connected player in the game with the lowest uid,
+    // or the lowest uid in the space when nobody is playing. Everyone works this out the same way, so
+    // only that person takes over and saves it. The host has to be gone for HOST_GRACE_MS first, and
+    // nobody takes over in their first HOST_GRACE_MS after loading, while the user list fills in.
+    const HOST_GRACE_MS = 5000;
+    function hostFor(game) {
+        const users = scene.users || {};
+        const state = game.gameState;
+        const host = state && state.currentHostUid;
+        const now = Date.now();
+        if (host && users[host]) {
+            game._hostGone = null;
+            return host;
+        }
+        if (host) {
+            if (!game._hostGone || game._hostGone.uid !== host) game._hostGone = { uid: host, since: now };
+            const loadedAt = game.readyTime || now;
+            if (now - game._hostGone.since < HOST_GRACE_MS || now - loadedAt < HOST_GRACE_MS) return host;
+        }
+        const players = Object.keys((state && state.players) || {}).filter(uid => users[uid]).sort();
+        return players[0] || Object.keys(users).sort()[0] || null;
+    }
+
     class BlackjackGame {
         constructor() {
             this.gameState = null;
@@ -104,6 +168,7 @@
                 volume: parseFloat(getParam("sound-volume", "0.4")), // 0-1; 0 = no sounds
                 soundNear: parseFloat(getParam("sound-near", "2.5")), // metres: full volume within this
                 soundFar: parseFloat(getParam("sound-far", "10")), // metres: silent from here
+                cullDistance: parseFloat(getParam("cull-distance", "20")), // metres: switched off beyond this (0 = never)
                 rotation: getParam("rotation", "0 0 0"),
                 instance: getParam("instance", "blackjack_game"),
                 debug: getParam("debug", "false") === "true"
@@ -111,6 +176,7 @@
             if (isNaN(this.params.volume)) this.params.volume = 0.4;
             if (isNaN(this.params.soundNear)) this.params.soundNear = 2.5;
             if (isNaN(this.params.soundFar)) this.params.soundFar = 10;
+            if (isNaN(this.params.cullDistance)) this.params.cullDistance = 20;
             this.stateKey = this.params.instance;
         }
 
@@ -190,6 +256,12 @@
             this.sync();
 
             setInterval(() => this.tick(), 1000);
+            this.readyTime = Date.now();
+            distanceSwitch(this, () => {
+                this.ui = { slices: [], centralPanel: null };
+                this.isConfirmationDialogOpen = false;
+                this.confirmCallback = null;
+            });
         }
 
         async buildEnvironment() {
@@ -479,8 +551,8 @@
                 return toggle;
             };
 
-            this.ui.doubleToggle = await createToggle(settingsRow, "Double Down", true, "doubleDown");
-            this.ui.splitToggle = await createToggle(settingsRow, "Split Pairs", true, "split");
+            this.ui.doubleToggle = await createToggle(settingsRow, "Double Down", this.gameState?.advancedSettings?.doubleDown !== false, "doubleDown");
+            this.ui.splitToggle = await createToggle(settingsRow, "Split Pairs", this.gameState?.advancedSettings?.split !== false, "split");
 
             const dLabel = panel.CreateLabel(undefined, rootEl);
             await dLabel.Async();
@@ -568,11 +640,7 @@
 
         isHost() {
             if (!scene || !scene.localUser) return false;
-            if (!this.gameState || !this.gameState.currentHostUid) {
-                const uids = Object.keys(scene.users || {}).sort();
-                return uids.length > 0 && uids[0] === scene.localUser.uid;
-            }
-            return this.gameState.currentHostUid === scene.localUser.uid;
+            return hostFor(this) === scene.localUser.uid;
         }
 
         sync() {
@@ -934,16 +1002,15 @@
         }
 
         tick() {
-            // Auto-claim host if none assigned and I'm the first in the list
-            if (scene.localUser && this.gameState && !this.gameState.currentHostUid) {
-                const uids = Object.keys(scene.users || {}).sort();
-                if (uids.length > 0 && uids[0] === scene.localUser.uid) {
-                    this.updateState({ currentHostUid: scene.localUser.uid });
-                }
-            }
-
-            if (this.isHost() && this.gameState) {
+            if (!this.gameState || !scene.localUser) return;
+            if (this.isHost()) {
                 let changed = false;
+                // We're running this, so we're the host (see hostFor). Save it if the old host left.
+                if (this.gameState.currentHostUid !== scene.localUser.uid) {
+                    this.log(`Taking over as host from ${this.gameState.currentHostUid || 'nobody'}.`);
+                    this.gameState.currentHostUid = scene.localUser.uid;
+                    changed = true;
+                }
                 const now = Date.now();
                 
                 // Disconnect logic
@@ -988,6 +1055,7 @@
         }
 
         updateTimerDisplay() {
+            if (this.culled) return;
             if (!this.gameState || !this.gameState.players) return;
 
             for (let i = 0; i < MAX_PLAYERS; i++) {
@@ -1013,6 +1081,7 @@
         // --- UI Updates ---
 
         updateUI() {
+            if (this.culled) return;
             if (!this.gameState) return;
 
             // Update Central Hub
