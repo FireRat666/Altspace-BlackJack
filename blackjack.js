@@ -79,42 +79,45 @@
     }
 
     // --- Switching off when far away ---
-    // Beyond `cull-distance` metres the whole game is deleted, so it costs nothing, and it is built
-    // again when the player comes back. (Switching it off with SetActive isn't enough: BanterUI panels
-    // lose their contents when switched off and on.) The game logic and the host duties keep running
-    // meanwhile; only the drawing stops. `resetUI` clears whatever pointed at the deleted objects.
-    function distanceSwitch(game, resetUI) {
+    // Beyond `cull-distance` metres the game is shrunk to nothing and stops updating its panels, and
+    // it grows back when the player returns. It isn't deleted and rebuilt: the app doesn't free
+    // everything a deleted UI panel used, so rebuilding leaked memory each time. (SetActive isn't
+    // used either: BanterUI panels lose their contents when switched off and on.) The game logic and
+    // the host duties keep running meanwhile.
+    function distanceSwitch(game) {
         const head = headTracker();
         const c = game.parseVector3(game.params.position);
         const centre = { x: c.x, y: c.y + 1, z: c.z }; // table height
-        let busy = false;
-        setInterval(async () => {
+        setInterval(() => {
             const far = game.params.cullDistance;
             const p = head.markerPos || head.posePos;
-            if (busy || !(far > 0) || !p) return;
+            if (!(far > 0) || !p || !game.root) return;
             const d = Math.hypot(p.x - centre.x, p.y - centre.y, p.z - centre.z);
-            busy = true;
             try {
                 if (!game.culled && d > far + 1) {
                     game.culled = true;
-                    const root = game.root;
-                    game.root = null;
-                    resetUI();
-                    if (root) root.Destroy();
+                    game.root.transform.localScale = new BS.Vector3(0, 0, 0);
                     game.log(`Switched off (${d.toFixed(1)} m away).`);
                 } else if (game.culled && d < far) {
-                    game.log(`Switching back on (${d.toFixed(1)} m away)...`);
-                    await game.buildEnvironment();
-                    if (game.ui.muteBtn) game.ui.muteBtn.text = game.isMuted ? "🔇" : "🔊";
                     game.culled = false;
+                    game.root.transform.localScale = new BS.Vector3(1, 1, 1);
+                    game.log(`Switched back on (${d.toFixed(1)} m away).`);
                     game.updateUI();
                 }
             } catch (err) {
                 console.warn("Distance switch failed", err);
-            } finally {
-                busy = false;
             }
         }, 1000);
+    }
+
+    // --- Times from other players ---
+    // Timestamps in the game state come from the clock of whoever wrote them, and players' clocks can
+    // be minutes or hours apart. So a stored timestamp is never compared with this device's clock:
+    // it's treated as a marker, and its age is counted from when this device first saw it.
+    const firstSeen = new Map();
+    function ageOf(ts) {
+        if (!firstSeen.has(ts)) firstSeen.set(ts, Date.now());
+        return Date.now() - firstSeen.get(ts);
     }
 
     // --- Host ---
@@ -257,11 +260,7 @@
 
             setInterval(() => this.tick(), 1000);
             this.readyTime = Date.now();
-            distanceSwitch(this, () => {
-                this.ui = { slices: [], centralPanel: null };
-                this.isConfirmationDialogOpen = false;
-                this.confirmCallback = null;
-            });
+            distanceSwitch(this);
         }
 
         async buildEnvironment() {
@@ -649,11 +648,12 @@
             try {
                 const newState = raw ? JSON.parse(raw) : this.getDefaultState();
                 if (JSON.stringify(this.gameState) !== JSON.stringify(newState)) {
+                    const hadState = !!this.gameState;
                     const oldSound = this.gameState ? this.gameState.lastSound : null;
                     this.gameState = newState;
                     
                     if (this.gameState.lastSound && (!oldSound || this.gameState.lastSound.ts !== oldSound.ts)) {
-                        if (this.gameState.lastSound.ts > this.joinTime) {
+                        if (hadState) { // not sounds from before we arrived
                             this.playLocalSound(this.gameState.lastSound.file);
                         }
                     }
@@ -1027,7 +1027,7 @@
                             changed = true;
                         }
                         
-                        if (!isConnected && p.disconnectTime > 0 && (now - p.disconnectTime > DISCONNECT_TIMEOUT_MS)) {
+                        if (!isConnected && p.disconnectTime > 0 && (ageOf(p.disconnectTime) > DISCONNECT_TIMEOUT_MS)) {
                             this.log(`Kicking ${uid} for disconnect.`);
                             // Determine if sound should be played:
                             // Play sound if the player was NOT disconnected when the state was initially loaded.
@@ -1040,7 +1040,7 @@
                 }
 
                 if (this.gameState.gameStarted && this.gameState.currentPlayerId && this.gameState.currentPlayerId !== "dealer") {
-                    if (now - this.gameState.turnStartTime > TURN_DURATION) {
+                    if (ageOf(this.gameState.turnStartTime) > TURN_DURATION) {
                         this.handleAction(this.gameState, this.gameState.currentPlayerId, "stand", {});
                         changed = true;
                     }
@@ -1070,7 +1070,7 @@
                 const isMyTurn = this.gameState.currentPlayerId === pid;
 
                 if (isMyTurn && this.gameState.turnStartTime && this.gameState.gameStarted) {
-                    const timeLeft = Math.max(0, Math.ceil((this.gameState.turnStartTime + TURN_DURATION - Date.now()) / 1000));
+                    const timeLeft = Math.max(0, Math.ceil((TURN_DURATION - ageOf(this.gameState.turnStartTime)) / 1000));
                     slice.timerText.text = `(${timeLeft}s)`;
                 } else {
                     slice.timerText.text = "";
